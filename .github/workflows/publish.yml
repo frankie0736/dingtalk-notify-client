@@ -1,0 +1,27 @@
+name: Publish
+
+# Publishes to npm when a v* tag is pushed. Requires repo secret NPM_TOKEN
+# (an npm automation token). Tag with: npm version <patch|minor|major> && git push --tags
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm install --no-package-lock
+      # prepublishOnly runs check + test + build before the package is packed.
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

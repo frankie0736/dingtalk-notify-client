@@ -1,0 +1,52 @@
+{
+  "name": "@frankie0736/dingtalk-notify",
+  "version": "0.1.0",
+  "description": "Thin client for the DingTalk Notification Server — send DingTalk group notifications over a single authenticated endpoint.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Frankie",
+  "homepage": "https://github.com/frankie0736/dingtalk-notify-client#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/frankie0736/dingtalk-notify-client.git"
+  },
+  "bugs": {
+    "url": "https://github.com/frankie0736/dingtalk-notify-client/issues"
+  },
+  "keywords": [
+    "dingtalk",
+    "钉钉",
+    "webhook",
+    "notification",
+    "robot",
+    "cloudflare-workers"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "types": "./dist/index.d.ts",
+  "main": "./dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit",
+    "test": "tsc -p tsconfig.build.json && node --test --experimental-strip-types",
+    "prepublishOnly": "tsc --noEmit && tsc -p tsconfig.build.json && node --test --experimental-strip-types"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "typescript": "^5.9.2"
+  }
+}
