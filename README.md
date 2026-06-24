@@ -1,5 +1,9 @@
 # @frankie0736/dingtalk-notify
 
+[![npm version](https://img.shields.io/npm/v/@frankie0736/dingtalk-notify.svg)](https://www.npmjs.com/package/@frankie0736/dingtalk-notify)
+[![CI](https://github.com/frankie0736/dingtalk-notify-client/actions/workflows/ci.yml/badge.svg)](https://github.com/frankie0736/dingtalk-notify-client/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/npm/l/@frankie0736/dingtalk-notify.svg)](./LICENSE)
+
 Thin, zero-dependency client for the [DingTalk Notification Server](https://github.com/frankie0736/dingtalk-notify-client). Send DingTalk group-chat notifications over a single authenticated endpoint — no HMAC signing, no `@mobile` injection, no per-service boilerplate.
 
 The server handles signing, encryption, and auditing. This package handles the one thing every caller would otherwise re-implement: a correct `fetch` with the right headers, body shape, and — crucially — the "HTTP 200 but DingTalk rejected it" failure that a naive wrapper silently treats as success.
