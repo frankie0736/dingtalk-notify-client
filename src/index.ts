@@ -7,7 +7,6 @@ export type {
   TextBody,
   MarkdownBody,
   NotifyBody,
-  DingTalkVerdict,
   NotifyResult,
   DingTalkOptions,
   ComboInput,

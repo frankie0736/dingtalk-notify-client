@@ -1,65 +1,47 @@
-/**
- * Wire types — a faithful replica of the server contract in
- * `dingtalk_notification_server/src/routes/notify.ts`. Keep these in sync
- * with that file when the server's request/response shape changes.
- */
-
-/** Mobile numbers to @-mention. Server rule: `/^\+?\d{6,20}$/`, max 50. */
+/** Mobile numbers to @-mention. Rule: `/^\+?\d{6,20}$/`, max 50. */
 export type AtMobiles = string[];
 
 /** Common `@` options shared by both message types. */
 export interface AtOptions {
-  /** Real blue-badge @ + device push (only effective for `text` messages). */
+  /** Real blue-badge @ + device push only for `text` messages. */
   atMobiles?: AtMobiles;
   /** @-everyone. Mutually exclusive with a non-empty `atMobiles`. */
   atAll?: boolean;
 }
 
-/** A `text` message: no rich formatting, but `atMobiles` triggers a real push. */
-export interface TextBody {
+/** A DingTalk `text` message: no rich formatting, but `atMobiles` triggers a real push. */
+export interface TextBody extends AtOptions {
   type: 'text';
-  /** 1–20000 chars. */
+  /** 1-20000 chars. */
   content: string;
-  atMobiles?: AtMobiles;
-  atAll?: boolean;
 }
 
-/** A `markdown` message: rich formatting, but `@` renders without a push. */
-export interface MarkdownBody {
+/** A DingTalk `markdown` message: rich formatting; `@` renders without a push. */
+export interface MarkdownBody extends AtOptions {
   type: 'markdown';
-  /** 1–200 chars. Shown as the card title / notification preview. */
+  /** 1-200 chars. Shown as the card title / notification preview. */
   title: string;
-  /** 1–20000 chars of DingTalk-flavored markdown. */
+  /** 1-20000 chars of DingTalk-flavored markdown. */
   content: string;
-  atMobiles?: AtMobiles;
-  atAll?: boolean;
 }
 
 /** Discriminated union accepted by {@link DingTalk.notify}. */
 export type NotifyBody = TextBody | MarkdownBody;
 
-/** DingTalk's verbatim verdict, normalized to camelCase. */
-export interface DingTalkVerdict {
-  httpStatus: number | null;
+/** DingTalk's direct response, normalized to camelCase and preserving raw text. */
+export interface NotifyResult {
+  httpStatus: number;
   errcode: number | null;
   errmsg: string | null;
-}
-
-/** Successful result of a notify call (`errcode === 0`). */
-export interface NotifyResult {
-  /** Server audit-log id (`lg_...`). */
-  logId: string;
-  /** End-to-end trace id (`rq_...`); also surfaced in server logs. */
-  requestId: string;
-  dingtalk: DingTalkVerdict;
+  rawBody: string;
 }
 
 /** Options for {@link DingTalk}. */
 export interface DingTalkOptions {
-  /** Per-robot bearer token (`dnk_...`). Required. */
-  token: string;
-  /** Server origin. Defaults to `https://dingtalk-notify.210k.cc`. */
-  baseUrl?: string;
+  /** DingTalk custom robot webhook URL, including `access_token`. */
+  webhook: string;
+  /** DingTalk custom robot signing secret. Omit for keyword/IP-whitelist robots. */
+  secret?: string;
   /** Per-request timeout in ms (via AbortController). Defaults to 10000. */
   timeoutMs?: number;
   /**
@@ -69,20 +51,18 @@ export interface DingTalkOptions {
   retries?: number;
   /** Custom fetch (for tests or non-standard runtimes). Defaults to global fetch. */
   fetch?: typeof fetch;
-  /** Overrides the default `User-Agent` header. */
-  userAgent?: string;
+  /** Timestamp provider for deterministic signing tests. Defaults to `Date.now`. */
+  now?: () => number;
 }
 
 /** Argument for {@link DingTalk.combo}. */
-export interface ComboInput {
+export interface ComboInput extends AtOptions {
   /** Short `text` line carrying the actual @-push. */
   alert: string;
   /** Markdown card title. */
   title: string;
   /** Markdown card body. */
   detail: string;
-  atMobiles?: AtMobiles;
-  atAll?: boolean;
 }
 
 /** Result of {@link DingTalk.combo}: both legs that were sent. */

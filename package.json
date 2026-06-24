@@ -1,7 +1,7 @@
 {
   "name": "@frankie0736/dingtalk-notify",
   "version": "0.1.0",
-  "description": "Thin client for the DingTalk Notification Server — send DingTalk group notifications over a single authenticated endpoint.",
+  "description": "Zero-dependency DingTalk custom robot client with local HMAC signing.",
   "type": "module",
   "license": "MIT",
   "author": "Frankie",

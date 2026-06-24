@@ -4,15 +4,14 @@
 [![CI](https://github.com/frankie0736/dingtalk-notify-client/actions/workflows/ci.yml/badge.svg)](https://github.com/frankie0736/dingtalk-notify-client/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/npm/l/@frankie0736/dingtalk-notify.svg)](./LICENSE)
 
-Thin, zero-dependency client for the [DingTalk Notification Server](https://github.com/frankie0736/dingtalk-notify-client). Send DingTalk group-chat notifications over a single authenticated endpoint — no HMAC signing, no `@mobile` injection, no per-service boilerplate.
+Zero-dependency DingTalk custom robot client. It signs the robot webhook locally with HMAC-SHA256, builds DingTalk's `text` / `markdown` payloads, injects `@` mentions, and posts directly to DingTalk.
 
-The server handles signing, encryption, and auditing. This package handles the one thing every caller would otherwise re-implement: a correct `fetch` with the right headers, body shape, and — crucially — the "HTTP 200 but DingTalk rejected it" failure that a naive wrapper silently treats as success.
+- Pure ESM.
+- Runs on Node.js 18+, Bun, and Cloudflare Workers / Edge.
+- No runtime dependency on any notification server.
+- Throws one `DingTalkError` type for validation, network, HTTP, and DingTalk business rejection failures.
 
-- **Pure ESM**, zero runtime dependencies.
-- Runs on **Node.js 18+, Bun, and Cloudflare Workers / Edge** (anything with global `fetch`).
-- **Throws on failure**, with a single `DingTalkError` whose `kind` tells you exactly what went wrong.
-
-> Not for browsers: the bearer token must never ship to a frontend.
+Do not use this package in browsers. The DingTalk webhook and secret are credentials.
 
 ## Install
 
@@ -22,60 +21,113 @@ npm install @frankie0736/dingtalk-notify
 bun add @frankie0736/dingtalk-notify
 ```
 
-## Quick start
+## Quick Start
 
 ```ts
 import { DingTalk } from '@frankie0736/dingtalk-notify';
 
-const dt = new DingTalk({ token: process.env.DINGTALK_TOKEN! }); // 'dnk_...'
+const dt = new DingTalk({
+  webhook: process.env.DINGTALK_WEBHOOK!,
+  secret: process.env.DINGTALK_SECRET, // optional for keyword/IP-whitelist robots
+});
 
-// Plain text — atMobiles here fires a real @-push + device notification.
-await dt.text('🔔 Build #123 failed', { atMobiles: ['13800138000'] });
+await dt.text('Build #123 failed', { atMobiles: ['13800138000'] });
 
-// Markdown card — rich formatting (no push; see below).
-await dt.markdown('Build #123', '### main 失败\n- env: prod\n- [logs](https://example.com)');
+await dt.markdown(
+  'Build #123',
+  '### main failed\n- env: prod\n- [logs](https://example.com)',
+);
 ```
 
-## `@`-mention behavior (a DingTalk platform quirk)
+## Mention Behavior
 
 | Mode | Rich formatting | `atMobiles` triggers push? |
 | --- | --- | --- |
-| `text` | No | **Yes** — real blue-badge @ + device notification |
-| `markdown` | Yes (lists, links, bold, code) | **No** — name renders in the card, but no push fires |
+| `text` | No | Yes. Real blue-badge `@` and device notification. |
+| `markdown` | Yes | No. DingTalk can render the name in the card, but it does not push. |
 
-This asymmetry is a DingTalk limitation, not a choice of this library.
+This is a DingTalk platform behavior. The package preserves it instead of hiding it.
 
-### `combo()` — push + rich content in one call
+### `combo()`
 
-When you need both a reliable @-push **and** a rich card, send a short `text` (the actual notification) followed by a `markdown` card with the detail:
+When you need both a real push and rich detail, send a short `text` first and a `markdown` card second:
 
 ```ts
 await dt.combo({
-  alert: '🔔 Build #123 failed — see detail',  // short text, carries the @
+  alert: 'Build #123 failed. See detail.',
   title: 'Build #123',
-  detail: '### main 失败\n- env: prod\n- [logs](https://example.com)',
+  detail: '### main failed\n- env: prod\n- [logs](https://example.com)',
   atMobiles: ['13800138000'],
 });
 ```
 
-The `text` leg is sent first (it's the real push). If the `markdown` leg then fails, the thrown error carries `comboLeg: 'markdown'` and the already-sent text result on `comboPartial.text`.
+If the markdown leg fails after the text leg succeeds, the thrown `DingTalkError` has `comboLeg: 'markdown'` and `comboPartial.text`.
 
-## Error handling
-
-Every method throws [`DingTalkError`](./src/errors.ts) on failure. Branch on `kind`:
+## API
 
 ```ts
-import { DingTalk, DingTalkError } from '@frankie0736/dingtalk-notify';
+new DingTalk({
+  webhook: 'https://oapi.dingtalk.com/robot/send?access_token=...',
+  secret: 'SEC...',       // optional
+  timeoutMs: 10_000,      // default
+  retries: 0,             // default; retries network failures and HTTP 5xx only
+  fetch: customFetch,     // optional
+  now: () => Date.now(),  // optional deterministic signing hook
+});
+```
+
+Methods:
+
+```ts
+await dt.text(content, { atMobiles, atAll });
+await dt.markdown(title, content, { atMobiles, atAll });
+await dt.notify({ type: 'text', content, atMobiles, atAll });
+await dt.notify({ type: 'markdown', title, content, atMobiles, atAll });
+await dt.combo({ alert, title, detail, atMobiles, atAll });
+```
+
+Validation runs before any request:
+
+- `content`: 1-20000 chars.
+- markdown `title`: 1-200 chars.
+- `atMobiles`: max 50, each matching `/^\+?\d{6,20}$/`.
+- `atAll` and non-empty `atMobiles` are mutually exclusive.
+
+## Result
+
+`text` / `markdown` / `notify` resolve to DingTalk's direct verdict:
+
+```ts
+{
+  httpStatus: 200,
+  errcode: 0,
+  errmsg: 'ok',
+  rawBody: '{"errcode":0,"errmsg":"ok"}',
+}
+```
+
+`combo()` resolves to `{ text: NotifyResult, markdown: NotifyResult }`.
+
+## Error Handling
+
+Every method throws `DingTalkError` on failure:
+
+```ts
+import { DingTalkError } from '@frankie0736/dingtalk-notify';
 
 try {
   await dt.text('hi', { atMobiles: ['13800138000'] });
 } catch (err) {
   if (err instanceof DingTalkError) {
     switch (err.kind) {
-      case 'validation': break; // bad input — no request was sent
-      case 'network':    break; // fetch failed or timed out
-      case 'http':       break; // non-2xx; err.status, err.serverError
-      case 'rejected':   break; // HTTP 200 but DingTalk said no; err.errcode, err.errmsg, err.logId
+      case 'validation':
+        break; // bad local input; no request sent
+      case 'network':
+        break; // fetch failed or timed out
+      case 'http':
+        break; // non-2xx; err.status and err.rawBody are available
+      case 'rejected':
+        break; // HTTP 2xx, but DingTalk returned errcode !== 0
     }
   }
 }
@@ -83,51 +135,28 @@ try {
 
 | `kind` | Meaning | Useful fields |
 | --- | --- | --- |
-| `validation` | Input rejected client-side; **no request sent** | `message` |
-| `network` | `fetch` threw or the request timed out | `cause` |
-| `http` | Server replied non-2xx | `status`, `serverError`, `details`, `requestId` |
-| `rejected` | HTTP 200 but `ok:false` (DingTalk rejected) | `errcode`, `errmsg`, `rawBody`, `logId`, `requestId` |
+| `validation` | Local input rejected before sending | `message` |
+| `network` | `fetch` threw or timed out | `cause` |
+| `http` | DingTalk replied non-2xx | `status`, `errcode`, `errmsg`, `rawBody` |
+| `rejected` | DingTalk replied 2xx with `errcode !== 0` | `errcode`, `errmsg`, `rawBody` |
 
-`err.retryable` is `true` for `network` failures and HTTP 5xx.
+`err.retryable` is true for `network` and HTTP 5xx failures only. DingTalk business rejections are not retried.
 
-## Options
+## DingTalk Limits
 
-```ts
-new DingTalk({
-  token: 'dnk_...',                          // required, per-robot bearer token
-  baseUrl: 'https://dingtalk-notify.210k.cc', // default
-  timeoutMs: 10_000,                          // per-request, via AbortController
-  retries: 0,                                 // retries network/timeout/5xx only; never 4xx or rejected
-  fetch: customFetch,                         // optional; defaults to global fetch
-  userAgent: '@frankie0736/dingtalk-notify',  // optional override
-});
-```
-
-## Result shape
-
-`text` / `markdown` / `notify` resolve to:
-
-```ts
-{
-  logId: string;      // server audit-log id (lg_...); cross-reference in /admin/logs
-  requestId: string;  // trace id (rq_...); also in server logs
-  dingtalk: { httpStatus: number | null; errcode: number | null; errmsg: string | null };
-}
-```
-
-`combo` resolves to `{ text: NotifyResult, markdown: NotifyResult }`.
-
-> Field names are camelCase here; the server's wire format uses snake_case (`log_id`, `request_id`, `at_mobiles`). The SDK converts both ways for you.
+DingTalk custom robots are limited to 20 messages per minute per robot. This package does not add client-side throttling; keep rate control at your job queue, worker, or application boundary.
 
 ## Development
 
 ```bash
 bun install
-bun run check   # typecheck
-bun run test    # build + node:test
-bun run build   # emit dist/
+bun run check
+bun run test
+bun run build
 ```
+
+Tests import `../dist/index.js`, so use `bun run test` after changing `src/`; it builds first.
 
 ## License
 
-MIT © Frankie
+MIT (c) Frankie

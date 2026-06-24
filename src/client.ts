@@ -1,5 +1,6 @@
 import { DingTalkError } from './errors.js';
 import type {
+  AtOptions,
   ComboInput,
   ComboResult,
   DingTalkOptions,
@@ -9,62 +10,30 @@ import type {
   TextBody,
 } from './types.js';
 
-const DEFAULT_BASE_URL = 'https://dingtalk-notify.210k.cc';
-const NOTIFY_PATH = '/api/v1/notify';
 const DEFAULT_TIMEOUT_MS = 10_000;
-const DEFAULT_USER_AGENT = '@frankie0736/dingtalk-notify';
 const MOBILE_RE = /^\+?\d{6,20}$/;
-
-/** Server response envelope (snake_case wire shape). */
-interface NotifyResponseBody {
-  ok?: boolean;
-  error?: string;
-  details?: unknown;
-  log_id?: string;
-  request_id?: string;
-  dingtalk?: {
-    http_status?: number | null;
-    errcode?: number | null;
-    errmsg?: string | null;
-    raw_body?: string;
-  };
-}
+const enc = new TextEncoder();
 
 const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
 
-/**
- * Client for the DingTalk Notification Server.
- *
- * ```ts
- * const dt = new DingTalk({ token: process.env.DINGTALK_TOKEN! });
- * await dt.text('🔔 Build #123 failed', { atMobiles: ['13800138000'] });
- * ```
- *
- * Every method throws {@link DingTalkError} on failure — including the
- * easy-to-miss case where the transport succeeds but DingTalk rejects the
- * message (HTTP 200, `ok:false`).
- */
 export class DingTalk {
-  readonly #token: string;
-  readonly #url: string;
+  readonly #webhook: string;
+  readonly #secret?: string;
   readonly #timeoutMs: number;
   readonly #retries: number;
   readonly #fetch: typeof fetch;
-  readonly #userAgent: string;
+  readonly #now: () => number;
 
   constructor(options: DingTalkOptions) {
-    if (!options || typeof options.token !== 'string' || options.token.length === 0) {
-      throw new DingTalkError({ kind: 'validation', message: 'token is required' });
+    if (!options || typeof options.webhook !== 'string' || options.webhook.length === 0) {
+      throw new DingTalkError({ kind: 'validation', message: 'webhook is required' });
     }
-    const base = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
-    this.#token = options.token;
-    this.#url = base + NOTIFY_PATH;
-    this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    this.#retries = Math.max(0, options.retries ?? 0);
-    this.#userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
+    if (options.secret !== undefined && (typeof options.secret !== 'string' || options.secret.length === 0)) {
+      throw new DingTalkError({ kind: 'validation', message: 'secret must be a non-empty string when provided' });
+    }
 
     const f = options.fetch ?? globalThis.fetch;
     if (typeof f !== 'function') {
@@ -73,21 +42,23 @@ export class DingTalk {
         message: 'global fetch is unavailable; pass options.fetch',
       });
     }
-    // Preserve `this` binding for environments where fetch is a bound global.
+
+    this.#webhook = options.webhook;
+    this.#secret = options.secret;
+    this.#timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.#retries = Math.max(0, options.retries ?? 0);
     this.#fetch = f.bind(globalThis);
+    this.#now = options.now ?? Date.now;
   }
 
-  /** Thin core: send a fully-formed message body. */
+  /** Send a fully-formed `text` or `markdown` message. */
   async notify(body: NotifyBody): Promise<NotifyResult> {
-    const wire = buildWire(body);
+    const wire = buildDingTalkBody(validateBody(body));
     return this.#sendWithRetry(wire);
   }
 
   /** Send a plain `text` message. `atMobiles` here triggers a real @-push. */
-  async text(
-    content: string,
-    opts: { atMobiles?: string[]; atAll?: boolean } = {},
-  ): Promise<NotifyResult> {
+  async text(content: string, opts: AtOptions = {}): Promise<NotifyResult> {
     const body: TextBody = { type: 'text', content };
     if (opts.atMobiles !== undefined) body.atMobiles = opts.atMobiles;
     if (opts.atAll !== undefined) body.atAll = opts.atAll;
@@ -95,15 +66,10 @@ export class DingTalk {
   }
 
   /**
-   * Send a `markdown` card. Note: per the DingTalk platform, `@` mentions
-   * render in the card but do **not** fire a device push — use {@link combo}
-   * (or a separate {@link text} call) when you need the push.
+   * Send a `markdown` card. Per DingTalk, `@` mentions render in the card but
+   * do not fire a device push; use {@link combo} when you need both.
    */
-  async markdown(
-    title: string,
-    content: string,
-    opts: { atMobiles?: string[]; atAll?: boolean } = {},
-  ): Promise<NotifyResult> {
+  async markdown(title: string, content: string, opts: AtOptions = {}): Promise<NotifyResult> {
     const body: MarkdownBody = { type: 'markdown', title, content };
     if (opts.atMobiles !== undefined) body.atMobiles = opts.atMobiles;
     if (opts.atAll !== undefined) body.atAll = opts.atAll;
@@ -111,16 +77,11 @@ export class DingTalk {
   }
 
   /**
-   * Recommended pattern when you want both a reliable @-push and rich content:
-   * send a short `text` (the actual notification, carrying the @) followed by a
-   * `markdown` card with the full detail.
-   *
-   * The `text` leg is sent first because it is the real push. If the `markdown`
-   * leg then fails, the thrown {@link DingTalkError} carries `comboLeg:'markdown'`
-   * and the already-succeeded `text` result on `comboPartial.text`.
+   * Send a short `text` push first, then a rich `markdown` card. If the second
+   * leg fails, the thrown error carries `comboPartial.text`.
    */
   async combo(input: ComboInput): Promise<ComboResult> {
-    const at: { atMobiles?: string[]; atAll?: boolean } = {};
+    const at: AtOptions = {};
     if (input.atMobiles !== undefined) at.atMobiles = input.atMobiles;
     if (input.atAll !== undefined) at.atAll = input.atAll;
 
@@ -139,11 +100,11 @@ export class DingTalk {
     }
   }
 
-  async #sendWithRetry(wire: WireBody): Promise<NotifyResult> {
+  async #sendWithRetry(body: DingTalkWireBody): Promise<NotifyResult> {
     let attempt = 0;
     for (;;) {
       try {
-        return await this.#sendOnce(wire);
+        return await this.#sendOnce(body);
       } catch (err) {
         const isRetryable = err instanceof DingTalkError && err.retryable;
         if (!isRetryable || attempt >= this.#retries) throw err;
@@ -153,7 +114,7 @@ export class DingTalk {
     }
   }
 
-  async #sendOnce(wire: WireBody): Promise<NotifyResult> {
+  async #sendOnce(body: DingTalkWireBody): Promise<NotifyResult> {
     const controller = new AbortController();
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -163,15 +124,10 @@ export class DingTalk {
 
     let res: Response;
     try {
-      res = await this.#fetch(this.#url, {
+      res = await this.#fetch(await this.#requestUrl(), {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          Authorization: `Bearer ${this.#token}`,
-          'User-Agent': this.#userAgent,
-        },
-        body: JSON.stringify(wire),
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
     } catch (err) {
@@ -184,98 +140,95 @@ export class DingTalk {
       clearTimeout(timer);
     }
 
-    const rawText = await res.text().catch(() => '');
-    let parsed: NotifyResponseBody | undefined;
-    if (rawText.length > 0) {
-      try {
-        parsed = JSON.parse(rawText) as NotifyResponseBody;
-      } catch {
-        parsed = undefined;
-      }
-    }
+    const rawBody = await res.text().catch(() => '');
+    const parsed = parseDingTalkResponse(rawBody);
 
     if (!res.ok) {
       throw new DingTalkError({
         kind: 'http',
         status: res.status,
-        message: `server returned HTTP ${res.status}${parsed?.error ? ` (${parsed.error})` : ''}`,
-        ...(parsed?.error !== undefined ? { serverError: parsed.error } : {}),
-        ...(parsed?.details !== undefined ? { details: parsed.details } : {}),
-        ...(parsed?.request_id !== undefined ? { requestId: parsed.request_id } : {}),
+        message: `DingTalk returned HTTP ${res.status}`,
+        errcode: parsed.errcode,
+        errmsg: parsed.errmsg,
+        rawBody,
       });
     }
 
-    if (!parsed) {
-      throw new DingTalkError({
-        kind: 'http',
-        status: res.status,
-        message: `server returned HTTP ${res.status} with an unparseable body`,
-      });
-    }
-
-    const dt = parsed.dingtalk ?? {};
-    if (parsed.ok === true) {
+    if (parsed.errcode === 0) {
       return {
-        logId: parsed.log_id ?? '',
-        requestId: parsed.request_id ?? '',
-        dingtalk: {
-          httpStatus: dt.http_status ?? null,
-          errcode: dt.errcode ?? null,
-          errmsg: dt.errmsg ?? null,
-        },
+        httpStatus: res.status,
+        errcode: parsed.errcode,
+        errmsg: parsed.errmsg,
+        rawBody,
       };
     }
 
-    // HTTP 200 but DingTalk rejected the message.
     throw new DingTalkError({
       kind: 'rejected',
-      message: `DingTalk rejected the message: ${dt.errmsg ?? 'unknown'} (errcode ${dt.errcode ?? 'unknown'})`,
-      errcode: dt.errcode ?? null,
-      errmsg: dt.errmsg ?? null,
-      ...(dt.raw_body !== undefined ? { rawBody: dt.raw_body } : {}),
-      ...(parsed.log_id !== undefined ? { logId: parsed.log_id } : {}),
-      ...(parsed.request_id !== undefined ? { requestId: parsed.request_id } : {}),
+      message: `DingTalk rejected the message: ${parsed.errmsg ?? 'unknown'} (errcode ${parsed.errcode ?? 'unknown'})`,
+      errcode: parsed.errcode,
+      errmsg: parsed.errmsg,
+      rawBody,
     });
+  }
+
+  async #requestUrl(): Promise<string> {
+    if (this.#secret === undefined) return this.#webhook;
+    return buildSignedUrl(this.#webhook, this.#secret, this.#now().toString());
   }
 }
 
-interface WireBody {
+interface NormalizedBody {
   type: 'text' | 'markdown';
   content: string;
   title?: string;
-  at_mobiles?: string[];
-  at_all?: boolean;
+  atMobiles?: string[];
+  atAll?: boolean;
 }
 
-/**
- * Re-wrap a leg failure with combo context, preserving every field. Non-SDK
- * errors (which shouldn't normally occur) are returned untouched.
- */
-function tagComboLeg(
-  err: unknown,
-  leg: 'text' | 'markdown',
-  partial?: { text?: NotifyResult },
-): unknown {
-  if (!(err instanceof DingTalkError)) return err;
-  return new DingTalkError({
-    kind: err.kind,
-    message: `combo ${leg} leg failed: ${err.message}`,
-    ...(err.status !== undefined ? { status: err.status } : {}),
-    ...(err.serverError !== undefined ? { serverError: err.serverError } : {}),
-    ...(err.details !== undefined ? { details: err.details } : {}),
-    ...(err.errcode !== undefined ? { errcode: err.errcode } : {}),
-    ...(err.errmsg !== undefined ? { errmsg: err.errmsg } : {}),
-    ...(err.rawBody !== undefined ? { rawBody: err.rawBody } : {}),
-    ...(err.logId !== undefined ? { logId: err.logId } : {}),
-    ...(err.requestId !== undefined ? { requestId: err.requestId } : {}),
-    comboLeg: leg,
-    ...(partial !== undefined ? { comboPartial: partial } : {}),
-    cause: err,
-  });
+type DingTalkWireBody =
+  | {
+      msgtype: 'text';
+      text: { content: string };
+      at: { atMobiles: string[]; isAtAll: boolean };
+    }
+  | {
+      msgtype: 'markdown';
+      markdown: { title: string; text: string };
+      at: { atMobiles: string[]; isAtAll: boolean };
+    };
+
+interface ParsedDingTalkResponse {
+  errcode: number | null;
+  errmsg: string | null;
 }
 
-/** Validate input at the boundary and convert to the snake_case wire shape. */
-function buildWire(body: NotifyBody): WireBody {
+function b64encode(bytes: Uint8Array): string {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+
+async function sign(secret: string, timestamp: string): Promise<string> {
+  const stringToSign = `${timestamp}\n${secret}`;
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(stringToSign)));
+  return encodeURIComponent(b64encode(sig));
+}
+
+async function buildSignedUrl(webhook: string, secret: string, timestamp: string): Promise<string> {
+  const s = await sign(secret, timestamp);
+  const sep = webhook.includes('?') ? '&' : '?';
+  return `${webhook}${sep}timestamp=${timestamp}&sign=${s}`;
+}
+
+function validateBody(body: NotifyBody): NormalizedBody {
   if (!body || (body.type !== 'text' && body.type !== 'markdown')) {
     throw new DingTalkError({
       kind: 'validation',
@@ -286,31 +239,30 @@ function buildWire(body: NotifyBody): WireBody {
   if (typeof body.content !== 'string' || body.content.length < 1 || body.content.length > 20_000) {
     throw new DingTalkError({
       kind: 'validation',
-      message: 'content must be a string of 1–20000 chars',
+      message: 'content must be a string of 1-20000 chars',
     });
   }
 
-  const wire: WireBody = { type: body.type, content: body.content };
+  const normalized: NormalizedBody = { type: body.type, content: body.content };
 
   if (body.type === 'markdown') {
     if (typeof body.title !== 'string' || body.title.length < 1 || body.title.length > 200) {
       throw new DingTalkError({
         kind: 'validation',
-        message: 'markdown title must be a string of 1–200 chars',
+        message: 'markdown title must be a string of 1-200 chars',
       });
     }
-    wire.title = body.title;
+    normalized.title = body.title;
   }
 
-  const atMobiles = body.atMobiles;
-  if (atMobiles !== undefined) {
-    if (!Array.isArray(atMobiles) || atMobiles.length > 50) {
+  if (body.atMobiles !== undefined) {
+    if (!Array.isArray(body.atMobiles) || body.atMobiles.length > 50) {
       throw new DingTalkError({
         kind: 'validation',
         message: 'atMobiles must be an array of at most 50 numbers',
       });
     }
-    for (const m of atMobiles) {
+    for (const m of body.atMobiles) {
       if (typeof m !== 'string' || !MOBILE_RE.test(m)) {
         throw new DingTalkError({
           kind: 'validation',
@@ -318,18 +270,78 @@ function buildWire(body: NotifyBody): WireBody {
         });
       }
     }
-    if (atMobiles.length > 0) wire.at_mobiles = atMobiles;
+    if (body.atMobiles.length > 0) normalized.atMobiles = body.atMobiles;
   }
 
   if (body.atAll === true) {
-    if (wire.at_mobiles && wire.at_mobiles.length > 0) {
+    if (normalized.atMobiles && normalized.atMobiles.length > 0) {
       throw new DingTalkError({
         kind: 'validation',
         message: 'atAll and atMobiles are mutually exclusive',
       });
     }
-    wire.at_all = true;
+    normalized.atAll = true;
   }
 
-  return wire;
+  return normalized;
+}
+
+function buildDingTalkBody(input: NormalizedBody): DingTalkWireBody {
+  const at = {
+    atMobiles: input.atMobiles ?? [],
+    isAtAll: input.atAll === true,
+  };
+
+  if (input.type === 'text') {
+    return {
+      msgtype: 'text',
+      text: { content: input.content },
+      at,
+    };
+  }
+
+  const trailingMentions =
+    input.atMobiles && input.atMobiles.length > 0
+      ? '\n\n' + input.atMobiles.map((m) => `@${m} `).join('')
+      : '';
+
+  return {
+    msgtype: 'markdown',
+    markdown: {
+      title: input.title ?? 'Notification',
+      text: input.content + trailingMentions,
+    },
+    at,
+  };
+}
+
+function parseDingTalkResponse(rawBody: string): ParsedDingTalkResponse {
+  try {
+    const parsed = JSON.parse(rawBody) as Partial<{ errcode: unknown; errmsg: unknown }>;
+    return {
+      errcode: typeof parsed.errcode === 'number' ? parsed.errcode : null,
+      errmsg: typeof parsed.errmsg === 'string' ? parsed.errmsg : null,
+    };
+  } catch {
+    return { errcode: null, errmsg: null };
+  }
+}
+
+function tagComboLeg(
+  err: unknown,
+  leg: 'text' | 'markdown',
+  partial?: { text?: NotifyResult },
+): unknown {
+  if (!(err instanceof DingTalkError)) return err;
+  return new DingTalkError({
+    kind: err.kind,
+    message: `combo ${leg} leg failed: ${err.message}`,
+    ...(err.status !== undefined ? { status: err.status } : {}),
+    ...(err.errcode !== undefined ? { errcode: err.errcode } : {}),
+    ...(err.errmsg !== undefined ? { errmsg: err.errmsg } : {}),
+    ...(err.rawBody !== undefined ? { rawBody: err.rawBody } : {}),
+    comboLeg: leg,
+    ...(partial !== undefined ? { comboPartial: partial } : {}),
+    cause: err,
+  });
 }
